@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.98.1"
 publish = false
 description = "A multi-agent harness in which several claude processes divide the work among themselves, with no central orchestrator"
+repository = "https://github.com/yusa-imit/colony"
 
 [lib]
 name = "colony"

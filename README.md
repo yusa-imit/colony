@@ -4,8 +4,9 @@ A multi-agent harness in which several `claude` processes **divide the work amon
 board, with no central orchestrator. It ships as a single binary (`colony`), and each worker uses the Claude
 Code installation you are already signed in to.
 
-colony brings the self-organizing structure of [Agensh](https://github.com/microsoft/Agensh)
-(arXiv 2609.26781) to a local machine. When one agent directs sub-agents, the orchestrator becomes a
+colony brings the self-organizing structure of Agensh
+([arXiv:2609.26781](https://arxiv.org/abs/2609.26781), [code](https://github.com/microsoft/Agensh)) to a
+local machine; see [Citation](#citation). When one agent directs sub-agents, the orchestrator becomes a
 bottleneck and a single point of failure. colony has no orchestrator. Workers read the board, claim tasks
 atomically, make changes in their own clones, merge by pushing to a shared hub, and record what they learn as
 notes.
@@ -175,3 +176,25 @@ MCP endpoint. It exercises the whole harness (contended pushes, limit handling, 
 without an LLM.
 
 Architecture and decisions: [`docs/design.md`](docs/design.md).
+
+## Citation
+
+colony is an independent implementation of the ideas introduced in Agensh. It is not affiliated with
+Microsoft or the paper's authors, and it contains no code from the Agensh repository. If colony is useful in
+your work, please cite the original paper:
+
+> Zhihao Zhan, Ting Song, Li Dong, Shaohan Huang, Jianxun Lian, Yan Xia, and Furu Wei.
+> *Agensh: Scaling Organizational Intelligence to 1,024 Agents.* arXiv:2609.26781, 2026.
+> <https://arxiv.org/abs/2609.26781>
+
+```bibtex
+@misc{zhan2026agenshscalingorganizationalintelligence,
+      title={Agensh: Scaling Organizational Intelligence to 1,024 Agents},
+      author={Zhihao Zhan and Ting Song and Li Dong and Shaohan Huang and Jianxun Lian and Yan Xia and Furu Wei},
+      year={2026},
+      eprint={2609.26781},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2609.26781},
+}
+```
