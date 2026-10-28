@@ -198,3 +198,7 @@ your work, please cite the original paper:
       url={https://arxiv.org/abs/2609.26781},
 }
 ```
+
+## License
+
+[MIT](LICENSE)
