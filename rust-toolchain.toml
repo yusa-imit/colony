@@ -1,0 +1,5 @@
+# Pinned toolchain. When bumping it, bump `rust-version` in Cargo.toml and `msrv` in clippy.toml too.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

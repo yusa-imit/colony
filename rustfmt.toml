@@ -1,0 +1,4 @@
+# Stable rustfmt options only (keeps `cargo fmt --check` clean)
+edition = "2021"
+max_width = 110
+newline_style = "Unix"

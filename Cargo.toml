@@ -1,0 +1,43 @@
+[package]
+name = "colony"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+publish = false
+description = "A multi-agent harness in which several claude processes divide the work among themselves, with no central orchestrator"
+
+[lib]
+name = "colony"
+path = "src/lib.rs"
+
+[[bin]]
+name = "colony"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "signal", "fs"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Shipped to colleagues as a single file, so optimize for size.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"

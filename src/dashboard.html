@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>colony</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e4e3de;
+  --open: #2f6fdb; --claimed: #b7791f; --done: #2f855a; --bad: #c53030; --chip: #efeee9;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151513; --panel: #1e1e1b; --ink: #ecebe6; --muted: #9a9991; --line: #2e2d29;
+    --open: #6b9cf0; --claimed: #e0a54a; --done: #5fbf8a; --bad: #f07272; --chip: #2a2925; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 13px/1.45 ui-sans-serif, -apple-system, "Apple SD Gothic Neo", "Segoe UI", sans-serif; }
+header { padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+.goal { color: var(--muted); white-space: pre-wrap; max-height: 4.4em; overflow: auto; }
+.stats { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; }
+.stat b { font-variant-numeric: tabular-nums; }
+.bad { color: var(--bad); }
+main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; padding: 12px 18px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+table { width: 100%; border-collapse: collapse; }
+td, th { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; }
+.act { color: var(--muted); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip { display: inline-block; padding: 0 6px; border-radius: 9px; background: var(--chip); font-size: 11px; }
+.ph-working { color: var(--claimed); } .ph-idle, .ph-exited { color: var(--muted); } .ph-failed { color: var(--bad); }
+.cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 600px) { .cols { grid-template-columns: 1fr; } }
+.col h3 { font-size: 12px; margin: 0 0 6px; }
+.col.open h3 { color: var(--open); } .col.claimed h3 { color: var(--claimed); } .col.done h3 { color: var(--done); }
+.task { border: 1px solid var(--line); border-radius: 6px; padding: 5px 7px; margin-bottom: 6px; }
+.task .meta { color: var(--muted); font-size: 11px; }
+.feed { max-height: 380px; overflow: auto; }
+.msg { padding: 3px 0; border-bottom: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; }
+.msg .from { font-weight: 600; margin-right: 6px; }
+.note { padding: 4px 0; border-bottom: 1px solid var(--line); }
+.note summary { cursor: pointer; }
+.note pre { white-space: pre-wrap; margin: 4px 0 0; font: inherit; color: var(--muted); }
+.stack { display: grid; gap: 12px; align-content: start; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">colony</h1>
+  <div class="goal" id="goal"></div>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <div class="stack">
+    <section><h2>Workers</h2><table id="agents"></table></section>
+    <section><h2>Tasks</h2><div class="cols" id="tasks"></div></section>
+  </div>
+  <div class="stack">
+    <section><h2>Chat</h2><div class="feed" id="chat"></div></section>
+    <section><h2>Shared notes</h2><div class="feed" id="notes"></div></section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const dur = (ms) => { const m = Math.max(0, Math.round(ms / 60000)); return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m` : `${m}m`; };
+const time = (ms) => new Date(ms).toLocaleTimeString();
+const pct = (x) => (x == null ? "-" : `${Math.round(x * 100)}%`);
+
+function render({ board, status, gate }) {
+  const now = Date.now();
+  $("title").textContent = `colony · ${status.repo || ""} · ${status.run_id || ""} · ${status.phase || ""}`;
+  $("goal").textContent = board.goal.text + (board.goal.summary ? `\n→ ${board.goal.summary}` : "");
+  const rl = status.rate_limit;
+  const stats = [
+    ["Elapsed", dur(now - status.started_ms)],
+    ["Time left", dur(status.deadline_ms - now)],
+    ["Active", `${status.active}/${status.limit} (max ${status.max_active}) · queued ${status.queued}`],
+    ["Cost", `$${(status.total_cost_usd || 0).toFixed(2)}${status.max_cost_usd ? ` / $${status.max_cost_usd}` : ""}`],
+    ["Gate", `${gate.holders.length}/${gate.slots}`],
+    ["Usage 5h/7d", rl ? `${pct(rl.five_hour)} / ${pct(rl.seven_day)} (${rl.status})` : "-"],
+    ["hub", (status.hub_head || "").slice(0, 8)],
+  ];
+  if (status.paused_until_ms) stats.push(["Paused", `${dur(status.paused_until_ms - now)} left`]);
+  $("stats").innerHTML = stats.map(([k, v]) => `<span class="stat ${k === "Paused" ? "bad" : ""}">${k} <b>${esc(v)}</b></span>`).join("");
+
+  $("agents").innerHTML = `<tr><th>Worker</th><th>State</th><th>Task</th><th class="num">Turns</th><th class="num">Cost</th><th>Last activity</th></tr>` +
+    (status.agents || []).map((a) => `<tr>
+      <td>${esc(a.id)}</td>
+      <td class="ph-${esc(a.phase)}">${esc(a.phase)}${a.restarts ? ` ↻${a.restarts}` : ""}</td>
+      <td>${esc(a.claim || "")}</td>
+      <td class="num">${a.turns}</td>
+      <td class="num">$${a.cost_usd.toFixed(2)}</td>
+      <td class="act" title="${esc(a.activity)}">${esc(a.activity)}</td></tr>`).join("");
+
+  const groups = { open: [], claimed: [], done: [] };
+  for (const t of board.tasks) groups[t.status].push(t);
+  const label = { open: "Open", claimed: "In progress", done: "Done" };
+  $("tasks").innerHTML = Object.entries(groups).map(([st, list]) => `<div class="col ${st}">
+    <h3>${label[st]} ${list.length}</h3>
+    ${(st === "done" ? list.slice().reverse() : list).map((t) => `<div class="task" title="${esc(t.detail)}">
+      <div><b>${esc(t.id)}</b> ${esc(t.title)}</div>
+      <div class="meta">${t.claimed_by ? esc(t.claimed_by) : `proposed by ${esc(t.proposed_by)}`}${t.deps.length ? ` · after ${esc(t.deps.join(","))}` : ""}${t.commit ? ` · ${esc(t.commit.slice(0, 8))}` : ""}</div>
+      ${t.summary ? `<div class="meta">${esc(t.summary)}</div>` : ""}
+    </div>`).join("")}</div>`).join("");
+
+  const chat = $("chat");
+  const stick = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 8;
+  chat.innerHTML = board.chat.map((m) => `<div class="msg"><span class="from">${esc(m.from)}</span><span class="chip">${time(m.at)}</span> ${esc(m.text)}</div>`).join("") || `<div class="msg">Nothing yet</div>`;
+  if (stick) chat.scrollTop = chat.scrollHeight;
+
+  $("notes").innerHTML = board.notes.slice().reverse().map((n) => `<details class="note"><summary><b>${esc(n.id)}</b> ${esc(n.title)} <span class="chip">${esc(n.by)}</span> ${n.tags.map((t) => `<span class="chip">${esc(t)}</span>`).join(" ")}</summary><pre>${esc(n.body)}</pre></details>`).join("") || `<div class="note">Nothing yet</div>`;
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    if (r.ok) render(await r.json());
+  } catch (_) { /* once the harness exits, keep showing the last state */ }
+  setTimeout(poll, 2000);
+}
+poll();
+</script>
+</body>
+</html>
