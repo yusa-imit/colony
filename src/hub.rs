@@ -14,6 +14,9 @@ use tokio::process::Command;
 
 pub const BRANCH: &str = "colony-main";
 
+/// Git-ignored scratch directory in every worker clone.
+pub const SCRATCH_DIR: &str = ".colony-tmp";
+
 /// Trailers that AI tools append to commit messages (`Co-Authored-By: Claude …`, `🤖 Generated with …`).
 /// As a rule, none of them may survive in colony's output. A `grep -E -i` pattern.
 pub const AI_TRAILER_PATTERN: &str =
@@ -134,6 +137,16 @@ impl Hub {
         // If setup (husky, etc.) changes core.hooksPath this hook won't run; the hub's pre-receive then
         // catches the trailer instead.
         install_hook(&dest.join(".git").join("hooks"), "commit-msg", &commit_msg_hook()).await?;
+        // Scratch space inside the clone. Writes outside it are denied, and a real run's workers otherwise
+        // put their probes in /tmp.
+        let exclude = dest.join(".git").join("info").join("exclude");
+        let mut text = tokio::fs::read_to_string(&exclude).await.unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("/{SCRATCH_DIR}/\n"));
+        tokio::fs::create_dir_all(exclude.parent().context("exclude path has no parent")?).await?;
+        tokio::fs::write(&exclude, text).await?;
         Ok(())
     }
 

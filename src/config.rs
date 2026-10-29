@@ -10,12 +10,16 @@ use serde::Deserialize;
 
 pub const CONFIG_FILE: &str = "colony.toml";
 
+/// Built-in tools a worker gets (`--tools`). A real run used only these; the full surface (32 tools, including
+/// push notifications, remote triggers and web access) acted outside the hub and added to every prompt. With
+/// `ToolSearch` absent, the colony MCP tools load up front instead of costing a search per session.
+pub const DEFAULT_TOOLS: &[&str] = &["Bash", "Read", "Edit", "Write", "Glob", "Grep"];
+
 /// Tools an unattended worker may use without asking. Everything else is denied via
-/// `--permission-prompts none`.
+/// `--permission-prompts none`. There is no bare `Write`/`Edit`: it allowed writes anywhere (observed: 30
+/// writes to /tmp). Each worker gets rules scoped to its own clone instead (worker.rs).
 pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "Read",
-    "Edit",
-    "Write",
     "Glob",
     "Grep",
     "TodoWrite",
@@ -43,6 +47,10 @@ pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "Bash(mkdir *)",
     "Bash(mv *)",
     "Bash(cp *)",
+    // Denied in a real run 19, 2 and 1 times: `cd <dir> && …`, `sed -i`, local binaries.
+    "Bash(cd *)",
+    "Bash(sed *)",
+    "Bash(./node_modules/.bin/*)",
 ];
 
 /// Tools blocked in unattended runs. Subagents multiply concurrency outside the harness's control,
@@ -60,6 +68,7 @@ pub struct FileConfig {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
+    pub tools: Option<Vec<String>>,
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Option<Vec<String>>,
     pub setting_sources: Option<String>,
@@ -71,6 +80,12 @@ pub struct FileConfig {
     pub base: Option<String>,
     pub idle_secs: Option<u64>,
     pub grace_secs: Option<u64>,
+    pub fresh_session: Option<bool>,
+    pub deliver_mid_turn: Option<bool>,
+    pub keep_workspaces: Option<bool>,
+    pub sandbox: Option<bool>,
+    pub sandbox_allowed_domains: Option<Vec<String>>,
+    pub sandbox_allow_write: Option<Vec<String>>,
     pub claude_bin: Option<String>,
     pub state_dir: Option<String>,
 }
@@ -107,6 +122,8 @@ pub struct Config {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: String,
+    /// Built-in tool set (`--tools`).
+    pub tools: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub setting_sources: String,
@@ -118,6 +135,19 @@ pub struct Config {
     pub base: String,
     pub idle_secs: u64,
     pub grace_secs: u64,
+    /// Restart a worker in a new session after each task it completes. Carrying earlier tasks' transcripts
+    /// was about a quarter of a real run's cost.
+    pub fresh_session: bool,
+    /// Deliver direct mentions and new notes after each tool call (PostToolUse hook → `colony inbox`).
+    pub deliver_mid_turn: bool,
+    /// Keep `ws/` after a completed run. By default it is removed (a real run left 2.2 GB).
+    pub keep_workspaces: bool,
+    /// Run Bash in Claude Code's sandbox: commands are auto-allowed and writes are confined to the clone,
+    /// the hub, temp dirs and `sandbox_allow_write`. Network is limited to localhost (the gate) and
+    /// `sandbox_allowed_domains`.
+    pub sandbox: bool,
+    pub sandbox_allowed_domains: Vec<String>,
+    pub sandbox_allow_write: Vec<String>,
     pub claude_bin: String,
     pub state_dir: PathBuf,
     pub port: u16,
@@ -144,6 +174,9 @@ impl Config {
                 .permission_mode
                 .or(file.permission_mode)
                 .unwrap_or_else(|| "acceptEdits".into()),
+            tools: file
+                .tools
+                .unwrap_or_else(|| DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect()),
             allowed_tools: file
                 .allowed_tools
                 .unwrap_or_else(|| DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect()),
@@ -157,8 +190,21 @@ impl Config {
             max_cost_usd: o.max_cost_usd.or(file.max_cost_usd),
             worker_budget_usd: file.worker_budget_usd,
             base: o.base.or(file.base).unwrap_or_else(|| "HEAD".into()),
-            idle_secs: o.idle_secs.or(file.idle_secs).unwrap_or(120),
+            // Agensh's idle detector waits 10 minutes; checking idle workers every 2 minutes mostly bought
+            // turns that found nothing to do.
+            idle_secs: o.idle_secs.or(file.idle_secs).unwrap_or(600),
             grace_secs: file.grace_secs.unwrap_or(300),
+            fresh_session: file.fresh_session.unwrap_or(true),
+            deliver_mid_turn: file.deliver_mid_turn.unwrap_or(true),
+            keep_workspaces: file.keep_workspaces.unwrap_or(false),
+            sandbox: file.sandbox.unwrap_or(false),
+            sandbox_allowed_domains: file.sandbox_allowed_domains.unwrap_or_default(),
+            sandbox_allow_write: file
+                .sandbox_allow_write
+                .unwrap_or_default()
+                .iter()
+                .map(|p| expand_home(p).to_string_lossy().into_owned())
+                .collect(),
             claude_bin: std::env::var("COLONY_CLAUDE_BIN")
                 .ok()
                 .or(file.claude_bin)
@@ -190,6 +236,11 @@ pub fn load_file(path: &Path) -> Result<FileConfig> {
     }
     let text = std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("invalid format in {}", path.display()))
+}
+
+/// The run directory root: the given path, or `~/.colony/runs`.
+pub fn state_dir(given: Option<&str>) -> PathBuf {
+    expand_home(given.unwrap_or("~/.colony/runs"))
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -226,6 +277,45 @@ mod tests {
         };
         let c = Config::resolve("g".into(), "/r".into(), FileConfig::default(), o).unwrap();
         assert_eq!(c.max_active, 8);
+    }
+
+    #[test]
+    fn defaults_scope_tools_and_enable_run_fixes() {
+        let c = Config::resolve(
+            "g".into(),
+            "/r".into(),
+            FileConfig::default(),
+            Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.tools, vec!["Bash", "Read", "Edit", "Write", "Glob", "Grep"]);
+        for bare in ["Write", "Edit"] {
+            assert!(
+                !c.allowed_tools.iter().any(|t| t == bare),
+                "bare {bare} would allow writes anywhere"
+            );
+        }
+        assert!(c.allowed_tools.iter().any(|t| t == "Bash(cd *)"));
+        assert!(c.fresh_session && c.deliver_mid_turn && !c.keep_workspaces && !c.sandbox);
+        assert_eq!(c.idle_secs, 600);
+    }
+
+    #[test]
+    fn reads_new_keys() {
+        let file: FileConfig = toml::from_str(
+            "tools = [\"Bash\", \"Read\"]\nfresh_session = false\ndeliver_mid_turn = false\nkeep_workspaces = true\n\
+             sandbox = true\nsandbox_allowed_domains = [\"registry.npmjs.org\"]\nsandbox_allow_write = [\"~/Library/pnpm\"]",
+        )
+        .unwrap();
+        let c = Config::resolve("g".into(), "/r".into(), file, Overrides::default()).unwrap();
+        assert_eq!(c.tools, vec!["Bash", "Read"]);
+        assert!(!c.fresh_session && !c.deliver_mid_turn && c.keep_workspaces && c.sandbox);
+        assert_eq!(c.sandbox_allowed_domains, vec!["registry.npmjs.org"]);
+        assert!(
+            c.sandbox_allow_write[0].ends_with("/Library/pnpm") && !c.sandbox_allow_write[0].starts_with('~'),
+            "{:?}",
+            c.sandbox_allow_write
+        );
     }
 
     #[test]

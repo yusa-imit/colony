@@ -1,9 +1,12 @@
 //! A fake `claude` for tests. It speaks the same stream-json as the real one and calls the real MCP
 //! endpoint over HTTP. Instead of an LLM it follows a fixed script: whoever claims the planning task T1
-//! splits the goal into three tasks; everyone claims a task → commits a file → pushes to the hub
-//! (rebasing when rejected) → task_complete, and tries goal_complete when there is nothing left to do.
+//! splits the goal into three tasks; everyone continues a task it holds (one handed over from a reservation
+//! included) or claims one → commits a file → pushes to the hub (rebasing when rejected) → task_complete. A
+//! claim on a blocked task reserves it and ends the turn. With nothing left to claim it runs `verify` and
+//! tries goal_complete. One task per turn, as the protocol asks; the harness then restarts the process in a
+//! fresh session.
 //!
-//! With `FAKE_LIMIT_AGENT=w2`, that worker's first turn ends on a usage limit (429).
+//! With `FAKE_LIMIT_AGENT=w2`, that worker's first turn ends on a usage limit (429), once per workspace.
 
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
@@ -17,7 +20,6 @@ struct Ctx {
     agent: String,
     session: String,
     turns: u32,
-    limited_once: bool,
 }
 
 fn main() {
@@ -45,7 +47,6 @@ fn main() {
             .or_else(|| flag("--resume"))
             .unwrap_or_default(),
         turns: 0,
-        limited_once: false,
     };
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -71,8 +72,10 @@ fn emit(v: Value) {
 fn turn(ctx: &mut Ctx) {
     ctx.turns += 1;
     let cost = f64::from(ctx.turns) * 0.01;
-    if !ctx.limited_once && std::env::var("FAKE_LIMIT_AGENT").ok().as_deref() == Some(ctx.agent.as_str()) {
-        ctx.limited_once = true;
+    // Once per workspace, not per process: the harness restarts workers between tasks.
+    let marker = std::env::current_dir().unwrap().join(".git").join("fake-limited");
+    if !marker.exists() && std::env::var("FAKE_LIMIT_AGENT").ok().as_deref() == Some(ctx.agent.as_str()) {
+        std::fs::write(&marker, "").unwrap();
         let resets = chrono_now_secs() + 2;
         emit(
             json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "rejected", "resetsAt": resets } }),
@@ -84,10 +87,21 @@ fn turn(ctx: &mut Ctx) {
         return;
     }
 
-    call(ctx, "board_view", json!({}));
+    // One API call's worth of usage, so the harness's live cost estimate has something to count.
+    emit(
+        json!({ "type": "assistant", "message": { "id": format!("msg-{}-{}", ctx.agent, ctx.turns),
+        "content": [], "usage": { "input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 1 } } }),
+    );
+    let (view, _) = call(ctx, "board_view", json!({}));
+    let held = view
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("YOU ({}) hold ", ctx.agent)))
+        .and_then(|rest| rest.split_whitespace().next())
+        .filter(|id| id.starts_with('T'))
+        .map(str::to_string);
     // Only the worker that claims the planning task T1 plans. The dep is given by title to exercise the
     // lenient input handling.
-    if !call(ctx, "task_claim", json!({ "id": "T1", "plan": "split the goal" })).1 {
+    if held.is_none() && claim(ctx, "T1", "split the goal") == Claimed::Held {
         let (text, err) = call(
             ctx,
             "task_propose",
@@ -104,17 +118,28 @@ fn turn(ctx: &mut Ctx) {
             json!({ "id": "T1", "summary": "planned 3 tasks" }),
         );
         assert!(!err, "completing the plan refused: {text}");
+        end_turn(cost);
+        return;
     }
-    let mut claimed = None;
-    for id in ["T2", "T3", "T4"] {
-        let (_, err) = call(ctx, "task_claim", json!({ "id": id, "plan": "write the file" }));
-        if !err {
-            claimed = Some(id);
-            break;
+    let mut claimed = held;
+    if claimed.is_none() {
+        for id in ["T2", "T3", "T4"] {
+            match claim(ctx, id, "write the file") {
+                Claimed::Held => {
+                    claimed = Some(id.to_string());
+                    break;
+                }
+                // Reserved: it becomes ours when its dep is done, and the harness wakes us then.
+                Claimed::Reserved => {
+                    end_turn(cost);
+                    return;
+                }
+                Claimed::Refused => {}
+            }
         }
     }
     let cwd = std::env::current_dir().unwrap();
-    match claimed {
+    match claimed.as_deref() {
         Some(id) => {
             hold_gate(ctx);
             std::fs::write(cwd.join(format!("{id}.txt")), format!("{id} by {}\n", ctx.agent)).unwrap();
@@ -151,6 +176,7 @@ fn turn(ctx: &mut Ctx) {
             );
         }
         None => {
+            call(ctx, "verify", json!({}));
             call(
                 ctx,
                 "goal_complete",
@@ -158,10 +184,31 @@ fn turn(ctx: &mut Ctx) {
             );
         }
     }
+    end_turn(cost);
+}
+
+fn end_turn(cost: f64) {
     emit(json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "turn done" }] } }));
     emit(
-        json!({ "type": "result", "subtype": "success", "is_error": false, "total_cost_usd": cost, "result": "ok" }),
+        json!({ "type": "result", "subtype": "success", "is_error": false, "total_cost_usd": cost,
+                 "result": "ok", "usage": { "input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 50 } }),
     );
+}
+
+#[derive(PartialEq)]
+enum Claimed {
+    Held,
+    Reserved,
+    Refused,
+}
+
+fn claim(ctx: &Ctx, id: &str, plan: &str) -> Claimed {
+    let (text, err) = call(ctx, "task_claim", json!({ "id": id, "plan": plan }));
+    match (err, text.starts_with("you reserve")) {
+        (true, _) => Claimed::Refused,
+        (false, true) => Claimed::Reserved,
+        (false, false) => Claimed::Held,
+    }
 }
 
 fn call(ctx: &Ctx, tool: &str, args: Value) -> (String, bool) {

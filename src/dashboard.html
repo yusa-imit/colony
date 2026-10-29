@@ -80,13 +80,15 @@ function render({ board, status, gate }) {
     ["Elapsed", dur(now - status.started_ms)],
     ["Time left", dur(status.deadline_ms - now)],
     ["Active", `${status.active}/${status.limit} (max ${status.max_active}) · queued ${status.queued}`],
-    ["Cost", `$${(status.total_cost_usd || 0).toFixed(2)}${status.max_cost_usd ? ` / $${status.max_cost_usd}` : ""}`],
+    ["Cost (live)", `$${(status.total_cost_usd || 0).toFixed(2)}${status.max_cost_usd ? ` / $${status.max_cost_usd}` : ""}`],
     ["Gate", `${gate.holders.length}/${gate.slots}`],
-    ["Usage 5h/7d", rl ? `${pct(rl.five_hour)} / ${pct(rl.seven_day)} (${rl.status})` : "-"],
+    ["Usage 5h/7d", rl ? `${pct(rl.five_hour)}${status.five_hour_projected != null ? ` → ${pct(status.five_hour_projected)} at reset` : ""} / ${pct(rl.seven_day)} (${rl.status})` : "-"],
+    ["Model", status.model || "-"],
     ["hub", (status.hub_head || "").slice(0, 8)],
   ];
   if (status.paused_until_ms) stats.push(["Paused", `${dur(status.paused_until_ms - now)} left`]);
-  $("stats").innerHTML = stats.map(([k, v]) => `<span class="stat ${k === "Paused" ? "bad" : ""}">${k} <b>${esc(v)}</b></span>`).join("");
+  const bad = (k) => k === "Paused" || (k === "Usage 5h/7d" && status.five_hour_projected > 1);
+  $("stats").innerHTML = stats.map(([k, v]) => `<span class="stat ${bad(k) ? "bad" : ""}">${k} <b>${esc(v)}</b></span>`).join("");
 
   $("agents").innerHTML = `<tr><th>Worker</th><th>State</th><th>Task</th><th class="num">Turns</th><th class="num">Cost</th><th>Last activity</th></tr>` +
     (status.agents || []).map((a) => `<tr>
@@ -104,7 +106,7 @@ function render({ board, status, gate }) {
     <h3>${label[st]} ${list.length}</h3>
     ${(st === "done" ? list.slice().reverse() : list).map((t) => `<div class="task" title="${esc(t.detail)}">
       <div><b>${esc(t.id)}</b> ${esc(t.title)}</div>
-      <div class="meta">${t.claimed_by ? esc(t.claimed_by) : `proposed by ${esc(t.proposed_by)}`}${t.deps.length ? ` · after ${esc(t.deps.join(","))}` : ""}${t.commit ? ` · ${esc(t.commit.slice(0, 8))}` : ""}</div>
+      <div class="meta">${t.claimed_by ? esc(t.claimed_by) : `proposed by ${esc(t.proposed_by)}`}${t.reserved_by ? ` · reserved ${esc(t.reserved_by)}` : ""}${t.deps.length ? ` · after ${esc(t.deps.join(","))}` : ""}${t.commit ? ` · ${esc(t.commit.slice(0, 8))}` : ""}</div>
       ${t.summary ? `<div class="meta">${esc(t.summary)}</div>` : ""}
     </div>`).join("")}</div>`).join("");
 

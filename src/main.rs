@@ -27,6 +27,15 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Print what this worker has not been shown yet, as PostToolUse hook output (used by workers' hooks)
+    #[command(hide = true)]
+    Inbox,
+    /// Remove the workspaces (ws/) of finished runs. Logs, board and hub are kept
+    Clean {
+        /// Where run directories are kept (default ~/.colony/runs)
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -92,6 +101,27 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Gate { cmd } => ExitCode::from(colony::gate::run_gated(&cmd).clamp(0, 255) as u8),
+        Cmd::Inbox => ExitCode::from(colony::inbox::run_inbox_hook().clamp(0, 255) as u8),
+        Cmd::Clean { state_dir } => {
+            let dir = config::state_dir(state_dir.as_deref());
+            match colony::run::clean(&dir) {
+                Ok(cleaned) => {
+                    for d in &cleaned {
+                        eprintln!("removed {}", d.join("ws").display());
+                    }
+                    eprintln!(
+                        "{} finished run(s) cleaned under {}",
+                        cleaned.len(),
+                        dir.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("colony: {e:#}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Cmd::Run(args) => match run(args) {
             Ok(code) => code,
             Err(e) => {
