@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::board::{short, BoardError, CommitCheck, GoalStatus, NewTask};
+use crate::board::{short, BoardError, Claim, CommitCheck, GoalStatus, NewTask};
 use crate::hub;
-use crate::server::Shared;
+use crate::server::{Shared, VerifyRun};
 use crate::supervisor::BoardSignal;
 
 /// Protocol version to answer with when the client sends none.
@@ -115,6 +115,39 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Wakes idle workers only when the change opened up claimable work. Waking everyone on every change bought
+/// turns that found nothing to do (observed: 41 of 50 turns in a real run held no task).
+fn signal_if_new_work(app: &Shared, before: &[String]) {
+    let after = app.board().claimable_ids();
+    if after.iter().any(|id| !before.contains(id)) {
+        app.signal(BoardSignal::NewWork);
+    }
+}
+
+/// Wakes the workers a message addresses by name. `@all` is an announcement read at the next turn start
+/// and wakes nobody.
+fn signal_direct(app: &Shared, mentions: &[String]) {
+    let direct: Vec<String> = mentions.iter().filter(|m| *m != "all").cloned().collect();
+    if !direct.is_empty() {
+        app.signal(BoardSignal::Mention(direct));
+    }
+}
+
+/// The `task_complete` answer. One task per turn: the protocol said to end the turn, but the old answer said
+/// "pick your next task", and workers ran 2–5 tasks per 20-minute turn (observed). Ending the turn lets the
+/// harness account cost, deliver messages and start a fresh session. Agensh also reminds a worker whose turn
+/// published nothing to shared context.
+fn complete_reply(id: &str, noted: bool) -> String {
+    let mut s = format!("{id} is done. End your turn now; your next turn starts with a fresh board digest.");
+    if !noted {
+        s.push_str(
+            " You added no note for this task: if you learned anything another worker could reuse (a \
+             convention, a command, a gotcha, an approach that failed), note_add it before ending your turn.",
+        );
+    }
+    s
+}
+
 /// `task_propose` input. The schema says `{tasks: [...]}`, but models sometimes send a single task flat as
 /// `{title, description}` or send `tasks` as a JSON string (observed in real runs), so those are accepted too.
 fn proposed_tasks(args: &Value) -> Result<Vec<NewTask>, String> {
@@ -160,8 +193,9 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
         "task_propose" => {
             let items = proposed_tasks(args)?;
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let before = app.board().claimable_ids();
             let ids = app.board().propose(agent, items, force, now()).map_err(err)?;
-            app.signal(BoardSignal::NewWork);
+            signal_if_new_work(app, &before);
             Ok(format!(
                 "proposed {}. Claim one with task_claim if you hold nothing.",
                 ids.join(", ")
@@ -170,11 +204,18 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
         "task_claim" => {
             let id = arg(args, "id")?;
             let plan = opt_arg(args, "plan").unwrap_or_default();
-            app.board().claim(agent, &id, &plan, now()).map_err(err)?;
-            Ok(format!(
-                "you hold {id}. Work in your clone; when it is done and checked, push to {} and call task_complete.",
-                hub::BRANCH
-            ))
+            match app.board().claim(agent, &id, &plan, now()).map_err(err)? {
+                Claim::Held => Ok(format!(
+                    "you hold {id}. Work in your clone; when it is done and checked, push to {} and call task_complete.",
+                    hub::BRANCH
+                )),
+                Claim::Reserved { waits } => Ok(format!(
+                    "you reserve {id}; it waits on {}. It becomes yours automatically when they are done (if you \
+                     hold no other task then), and you will be woken. Prepare locally if useful, but push only \
+                     once it is yours. task_release {id} drops the reservation.",
+                    waits.join(", ")
+                )),
+            }
         }
         "task_progress" => {
             let id = arg(args, "id")?;
@@ -185,10 +226,11 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
         }
         "task_release" => {
             let id = arg(args, "id")?;
+            let before = app.board().claimable_ids();
             app.board()
                 .release(agent, &id, &arg(args, "reason")?, now())
                 .map_err(err)?;
-            app.signal(BoardSignal::NewWork);
+            signal_if_new_work(app, &before);
             Ok(format!("released {id}; it is open again"))
         }
         "task_complete" => {
@@ -210,15 +252,24 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
                     })
                 }
             };
-            app.board()
-                .complete(agent, &id, &summary, check, now())
-                .map_err(err)?;
-            app.signal(BoardSignal::NewWork);
-            Ok(format!("{id} is done. Pick your next task (board_view)."))
+            let before = app.board().claimable_ids();
+            let (auto, all_done, noted) = {
+                let mut b = app.board();
+                let auto = b.complete(agent, &id, &summary, check, now()).map_err(err)?;
+                (auto, b.is_closable(), b.noted_since_claim(agent, &id))
+            };
+            app.signal(BoardSignal::TaskDone {
+                agent: agent.to_string(),
+                all_done,
+            });
+            signal_direct(app, &auto.into_iter().map(|a| a.agent).collect::<Vec<_>>());
+            signal_if_new_work(app, &before);
+            Ok(complete_reply(&id, noted))
         }
         "task_reopen" => {
             let id = arg(args, "id")?;
             let reason = arg(args, "reason")?;
+            let before = app.board().claimable_ids();
             let mention = {
                 let mut b = app.board();
                 let owner = b.task(&id).and_then(|t| t.claimed_by.clone());
@@ -229,17 +280,13 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
                 };
                 b.post(agent, &text, now()).map_err(err)?.mentions
             };
-            app.signal(BoardSignal::NewWork);
-            if !mention.is_empty() {
-                app.signal(BoardSignal::Mention(mention));
-            }
+            signal_if_new_work(app, &before);
+            signal_direct(app, &mention);
             Ok(format!("reopened {id}"))
         }
         "chat_post" => {
             let msg = app.board().post(agent, &arg(args, "text")?, now()).map_err(err)?;
-            if !msg.mentions.is_empty() {
-                app.signal(BoardSignal::Mention(msg.mentions.clone()));
-            }
+            signal_direct(app, &msg.mentions);
             Ok(format!("posted #{}", msg.seq))
         }
         "chat_read" => {
@@ -288,6 +335,10 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
             }
             Ok(out)
         }
+        "verify" => {
+            let (run, cached) = verify_main(app, agent).await?;
+            Ok(describe_verify(app, &run, cached))
+        }
         "goal_complete" => {
             let summary = opt_arg(args, "summary").unwrap_or_else(|| "(no summary given)".into());
             goal_complete(app, agent, &summary).await
@@ -296,42 +347,96 @@ async fn call_tool(app: &Shared, agent: &str, name: &str, args: &Value) -> ToolR
     }
 }
 
+/// The cached run for `head`, if any.
+fn cached_for<'a>(cache: &'a Option<VerifyRun>, head: &str) -> Option<&'a VerifyRun> {
+    cache.as_ref().filter(|r| r.head == head)
+}
+
+/// Runs the configured verify command on colony-main's latest commit, or returns the result already recorded
+/// for that commit. The bool is true for a cached result.
+async fn verify_main(app: &Shared, agent: &str) -> Result<(VerifyRun, bool), String> {
+    let Some(v) = &app.verify else {
+        return Err("no verify command is configured for this run; check colony-main yourself".into());
+    };
+    // One run at a time; a second caller waits and then finds the first one's result in the cache.
+    let _turn = app.verify_lock.lock().await;
+    let head = app.hub.head().await.map_err(|e| format!("{e:#}"))?;
+    let hit = app
+        .verify_cache
+        .lock()
+        .ok()
+        .and_then(|c| cached_for(&c, &head).cloned());
+    if let Some(r) = hit {
+        return Ok((r, true));
+    }
+    let head = hub::sync_to_hub(&v.workspace)
+        .await
+        .map_err(|e| format!("verify checkout failed: {e:#}"))?;
+    let out = {
+        let _lease = app.gate.acquire(agent, "verify").await;
+        hub::run_shell(&v.workspace, &v.command, VERIFY_TIMEOUT, 60)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+    };
+    let run = VerifyRun {
+        head,
+        ok: out.ok,
+        code: out.code,
+        tail: out.tail,
+        by: agent.to_string(),
+        at_ms: now(),
+    };
+    if let Ok(mut c) = app.verify_cache.lock() {
+        *c = Some(run.clone());
+    }
+    Ok((run, false))
+}
+
+fn describe_verify(app: &Shared, run: &VerifyRun, cached: bool) -> String {
+    let cmd = app.verify.as_ref().map(|v| v.command.as_str()).unwrap_or("");
+    let ago = (now() - run.at_ms).max(0) / 60_000;
+    let origin = if cached {
+        format!("cached: run by {} {ago}m ago", run.by)
+    } else {
+        format!("run by {}", run.by)
+    };
+    if run.ok {
+        format!(
+            "verify `{cmd}` passed on {} @{} ({origin}).",
+            hub::BRANCH,
+            short(&run.head)
+        )
+    } else {
+        format!(
+            "verify `{cmd}` FAILED on {} @{} (exit {:?}; {origin}). Last lines:\n{}",
+            hub::BRANCH,
+            short(&run.head),
+            run.code,
+            run.tail
+        )
+    }
+}
+
 async fn goal_complete(app: &Shared, agent: &str, summary: &str) -> ToolResult {
     app.board().check_closable().map_err(err)?;
-    if let Some(v) = &app.verify {
-        // Even if two workers declare at once, verification runs one at a time.
-        let _turn = app.verify_lock.lock().await;
+    if app.verify.is_some() {
+        let (run, cached) = verify_main(app, agent).await?;
         if app.board().goal().status != GoalStatus::Active {
             return Ok("the goal is already closed; end your turn".into());
         }
-        app.board().check_closable().map_err(err)?;
-        let head = hub::sync_to_hub(&v.workspace)
-            .await
-            .map_err(|e| format!("verify checkout failed: {e:#}"))?;
-        let out = {
-            let _lease = app.gate.acquire(agent, "goal verify").await;
-            hub::run_shell(&v.workspace, &v.command, VERIFY_TIMEOUT, 60)
-                .await
-                .map_err(|e| format!("{e:#}"))?
-        };
-        if !out.ok {
-            let note = format!(
-                "@all goal_complete by {agent} was refused: `{}` fails on {} @{}. Fixing the branch comes first.",
-                v.command,
-                hub::BRANCH,
-                short(&head)
-            );
-            if let Ok(m) = app.board().post("colony", &note, now()) {
-                app.signal(BoardSignal::Mention(m.mentions));
+        if !run.ok {
+            // Announce a fresh failure once; a cached one was already announced.
+            if !cached {
+                let note = format!(
+                    "@all goal_complete by {agent} was refused: verify fails on {} @{}. Fixing the branch comes first.",
+                    hub::BRANCH,
+                    short(&run.head)
+                );
+                if let Ok(m) = app.board().post("colony", &note, now()) {
+                    app.signal(BoardSignal::Mention(m.mentions));
+                }
             }
-            return Err(format!(
-                "verify `{}` failed on {} @{} (exit {:?}). Last lines:\n{}",
-                v.command,
-                hub::BRANCH,
-                short(&head),
-                out.code,
-                out.tail
-            ));
+            return Err(describe_verify(app, &run, cached));
         }
     }
     app.board().close_goal(agent, summary).map_err(err)?;
@@ -344,7 +449,7 @@ pub fn tool_list() -> Value {
     json!([
         {
             "name": "board_view",
-            "description": "The shared board: goal, your claim, claimable tasks, every task's status, unread chat that mentions you, latest notes. Call it at the start of every turn.",
+            "description": "The shared board: goal status, your claim and reservation, claimable tasks, every task's status, unread chat for you, latest notes. Call it at the start of every turn.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -377,7 +482,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "task_claim",
-            "description": "Atomically claim an open task whose deps are done. You can hold one task at a time. The plan is shown to others as your intent.",
+            "description": "Atomically claim an open task whose deps are done (you can hold one at a time), or reserve one whose deps are pending: it becomes yours when they are done. The plan is shown to others as your intent.",
             "inputSchema": { "type": "object", "properties": { "id": id, "plan": { "type": "string" } }, "required": ["id", "plan"] }
         },
         {
@@ -387,12 +492,12 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "task_release",
-            "description": "Give back the task you hold (blocked, wrong, or too big; propose smaller tasks first if so). It becomes open again.",
+            "description": "Give back the task you hold (blocked, wrong, or too big; propose smaller tasks first if so), or drop your reservation. It becomes open again.",
             "inputSchema": { "type": "object", "properties": { "id": id, "reason": { "type": "string" } }, "required": ["id", "reason"] }
         },
         {
             "name": "task_complete",
-            "description": "Mark the task you hold done. If you changed code, pass the commit you pushed to colony-main (git rev-parse HEAD after the push); it is refused unless that commit is on colony-main.",
+            "description": "Mark the task you hold done, then end your turn. If you changed code, pass the commit you pushed to colony-main (git rev-parse HEAD after the push); it is refused unless that commit is on colony-main.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": id, "summary": { "type": "string" }, "commit": { "type": "string" } },
@@ -406,7 +511,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "chat_post",
-            "description": "Post to the shared channel. @w07 addresses one worker, @all everyone; addressed idle workers are woken up.",
+            "description": "Post to the shared channel. @w07 reaches that worker even mid-task and wakes it if idle; @all is an announcement read at the next turn and wakes nobody.",
             "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] }
         },
         {
@@ -433,6 +538,11 @@ pub fn tool_list() -> Value {
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } } }
         },
         {
+            "name": "verify",
+            "description": "Run the configured verify command on colony-main's latest commit and report pass or fail with the output tail. Results are cached per commit, so asking again on the same commit costs nothing.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "goal_complete",
             "description": "Declare the whole goal done after verifying it on colony-main. Refused while any task is open or claimed, or when the configured verify command fails.",
             "inputSchema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] }
@@ -456,6 +566,42 @@ mod tests {
             arg(&json!({ "text": " " }), "text").unwrap_err(),
             "`text` is required"
         );
+    }
+
+    #[test]
+    fn verify_cache_hits_only_on_the_same_head() {
+        let run = VerifyRun {
+            head: "abc".into(),
+            ok: true,
+            code: Some(0),
+            tail: String::new(),
+            by: "w3".into(),
+            at_ms: 0,
+        };
+        let cache = Some(run);
+        assert!(cached_for(&cache, "abc").is_some());
+        assert!(cached_for(&cache, "def").is_none());
+        assert!(cached_for(&None, "abc").is_none());
+    }
+
+    #[test]
+    fn complete_reply_ends_the_turn_and_asks_for_a_note_when_none_was_added() {
+        let with_note = complete_reply("T3", true);
+        assert!(with_note.contains("End your turn now"), "{with_note}");
+        assert!(!with_note.contains("note_add"), "{with_note}");
+        assert!(complete_reply("T3", false).contains("note_add"));
+    }
+
+    #[test]
+    fn tool_list_offers_verify() {
+        let tools = tool_list();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"verify"), "{names:?}");
     }
 
     #[test]

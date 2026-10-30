@@ -22,6 +22,13 @@ async fn first_push_wins_and_merge_checks_follow_the_branch() {
     hub.clone_workspace(&a, "w1", "me@example.com").await.unwrap();
     hub.clone_workspace(&b, "w2", "me@example.com").await.unwrap();
     assert_eq!(git(&a, &["config", "user.name"]), "colony w1");
+    std::fs::create_dir_all(a.join(".colony-tmp")).unwrap();
+    std::fs::write(a.join(".colony-tmp/probe.mjs"), "1").unwrap();
+    assert_eq!(
+        git(&a, &["status", "--porcelain"]),
+        "",
+        "scratch files are ignored"
+    );
 
     let sha_a = commit_file(&a, "a.txt", "a");
     let sha_b = commit_file(&b, "b.txt", "b");

@@ -2,8 +2,10 @@
 //!
 //! It starts workers on a stagger (ramp), keeps the number of workers mid-turn within a limit, and when a
 //! worker's turn ends either hands it the next turn with a digest of board changes or puts it to sleep
-//! until there is work. On a usage limit it pauses everyone and halves concurrency, then raises it one
-//! step at a time while turns keep succeeding.
+//! until there is work. A worker that finished a task starts its next one in a fresh session. On a usage
+//! limit it pauses everyone and halves concurrency, then raises it one step at a time while turns keep
+//! succeeding; it also lowers concurrency when the five-hour window is projected to run out. Cost is
+//! estimated live from every API call, so the cap holds mid-turn.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -16,6 +18,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::board::GoalStatus;
 use crate::config::Config;
+use crate::cost::Meter;
 use crate::hub;
 use crate::prompts::{self, Nudge};
 use crate::server::Shared;
@@ -32,6 +35,15 @@ const MIN_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_PAUSE: Duration = Duration::from_secs(6 * 3600);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REPORT_EVERY_TICKS: u64 = 60;
+/// How long a recycling worker may take to exit after its stdin closes before it is killed.
+const RECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on the wait after a budget stop. In-flight turns are interrupted, so they end at once.
+const BUDGET_GRACE_SECS: u64 = 30;
+/// Five-hour utilization history used for the projection.
+const UTILIZATION_WINDOW_SECS: i64 = 15 * 60;
+const MIN_PROJECTION_SPAN_SECS: i64 = 3 * 60;
+const MIN_SAMPLE_GAP_SECS: i64 = 10;
+const PROJECTION_CUT_EVERY: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub enum SupEvent {
@@ -63,6 +75,11 @@ pub enum BoardSignal {
     NewWork,
     /// Workers mentioned in chat. `"all"` means everyone.
     Mention(Vec<String>),
+    /// A worker completed a task. `all_done`: no task is open or claimed any more.
+    TaskDone {
+        agent: String,
+        all_done: bool,
+    },
     GoalClosed,
 }
 
@@ -100,6 +117,8 @@ pub enum Phase {
     Working,
     /// Nothing to do; waiting for the board to change.
     Idle,
+    /// Finished a task; the process is exiting so the next task starts in a fresh session.
+    Recycling,
     /// Stdin closed; waiting for the process to exit.
     Closing,
     Exited,
@@ -110,6 +129,52 @@ pub enum Phase {
 enum Next {
     Kickoff,
     Nudge(Nudge),
+}
+
+/// What a worker does when its turn ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Go(Nudge),
+    Sleep,
+}
+
+/// The rules for the next turn, kept pure so tests pin them down. Only direct mentions count: an `@all`
+/// announcement waits for the next turn instead of buying one (observed: 8 turns in a real run went to
+/// unread announcements).
+pub fn decide_next(
+    has_claim: bool,
+    all_done: bool,
+    direct_mentions: usize,
+    claimable: usize,
+    idle_turns: u32,
+) -> Decision {
+    if has_claim {
+        Decision::Go(Nudge::Continue)
+    } else if all_done {
+        Decision::Go(Nudge::AllDone)
+    } else if direct_mentions > 0 || (claimable > 0 && idle_turns <= MAX_IDLE_TURNS) {
+        Decision::Go(Nudge::Continue)
+    } else {
+        Decision::Sleep
+    }
+}
+
+/// A worker that completed a task and holds nothing starts over in a new session. Every call of a later
+/// task otherwise re-reads the earlier tasks' transcripts (observed: about a quarter of a real run's cost).
+pub fn should_recycle(fresh_session: bool, has_claim: bool, done_in_session: u32) -> bool {
+    fresh_session && !has_claim && done_in_session > 0
+}
+
+/// Five-hour utilization at the window's reset if the recent slope holds. `None` with less than a few
+/// minutes of history or a reset already past. A falling slope is not extrapolated.
+pub fn project_utilization(samples: &VecDeque<(i64, f64)>, now_s: i64, resets_at: i64) -> Option<f64> {
+    let (t0, u0) = *samples.front()?;
+    let (t1, u1) = *samples.back()?;
+    if t1 - t0 < MIN_PROJECTION_SPAN_SECS || resets_at <= now_s {
+        return None;
+    }
+    let slope = ((u1 - u0) / (t1 - t0) as f64).max(0.0);
+    Some(u1 + slope * (resets_at - now_s) as f64)
 }
 
 struct Slot {
@@ -127,10 +192,22 @@ struct Slot {
     restarts: u32,
     cost_done: f64,
     cost_cur: f64,
+    /// Input-side weighted tokens of API calls since the last `result`; priced by the meter.
+    live_units: f64,
+    last_msg_id: String,
     activity: String,
     idle_until: Option<Instant>,
     idle_backoff: Duration,
     seen_tasks: usize,
+    /// Tasks completed in the current session.
+    done_in_session: u32,
+    /// The next message starts a fresh session.
+    fresh: bool,
+    /// What to do once a recycling worker's new process is up.
+    after_recycle: Option<Decision>,
+    recycle_deadline: Option<Instant>,
+    /// A budget stop: interrupt the running turn, then close stdin.
+    interrupt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -158,6 +235,10 @@ pub struct RunStatus {
     pub queued: usize,
     pub paused_until_ms: Option<i64>,
     pub rate_limit: Option<RateLimitInfo>,
+    /// Five-hour utilization projected to the window's reset.
+    pub five_hour_projected: Option<f64>,
+    /// The model the workers resolved to (from claude's init event).
+    pub model: Option<String>,
     pub total_cost_usd: f64,
     pub max_cost_usd: Option<f64>,
     pub hub_head: String,
@@ -172,6 +253,8 @@ pub struct RunCtx {
     pub server_url: String,
     pub email: String,
     pub system_prompt: String,
+    /// The colony binary, run by each worker's inbox hook. `None` disables mid-turn delivery.
+    pub colony_bin: Option<PathBuf>,
 }
 
 impl RunCtx {
@@ -211,6 +294,14 @@ pub struct Supervisor {
     started_ms: i64,
     deadline: Instant,
     hub_head: String,
+    meter: Meter,
+    /// The worker that completed the last task; its next turn asks it to close the goal.
+    all_done_for: Option<usize>,
+    model: Option<String>,
+    five_hour: VecDeque<(i64, f64)>,
+    five_hour_resets_at: Option<i64>,
+    projected: Option<f64>,
+    last_projection_cut: Option<Instant>,
 }
 
 impl Supervisor {
@@ -238,10 +329,17 @@ impl Supervisor {
                 restarts: 0,
                 cost_done: 0.0,
                 cost_cur: 0.0,
+                live_units: 0.0,
+                last_msg_id: String::new(),
                 activity: String::new(),
                 idle_until: None,
                 idle_backoff: Duration::from_secs(cfg.idle_secs),
                 seen_tasks: 0,
+                done_in_session: 0,
+                fresh: false,
+                after_recycle: None,
+                recycle_deadline: None,
+                interrupt: false,
             })
             .collect();
         let deadline = started + Duration::from_secs_f64(cfg.hours * 3600.0);
@@ -263,6 +361,13 @@ impl Supervisor {
             started_ms: chrono::Utc::now().timestamp_millis(),
             deadline,
             hub_head: String::new(),
+            meter: Meter::default(),
+            all_done_for: None,
+            model: None,
+            five_hour: VecDeque::new(),
+            five_hour_resets_at: None,
+            projected: None,
+            last_projection_cut: None,
             ctx,
         }
     }
@@ -282,6 +387,7 @@ impl Supervisor {
                     self.on_tick(ticks).await;
                 }
             }
+            self.flush_interrupts().await;
             self.pump().await;
             self.publish();
             if self.finished() {
@@ -313,8 +419,23 @@ impl Supervisor {
                     return;
                 }
                 match ev {
-                    StreamEvent::Init { .. } => {}
-                    StreamEvent::Activity(a) => self.slots[idx].activity = a,
+                    StreamEvent::Init { model, .. } => {
+                        if self.model.is_none() && !model.is_empty() {
+                            log(&format!("model: {model}"));
+                            self.model = Some(model);
+                        }
+                    }
+                    StreamEvent::Assistant { id, activity, usage } => {
+                        let slot = &mut self.slots[idx];
+                        if let Some(a) = activity {
+                            slot.activity = a;
+                        }
+                        // Every stream line of one message repeats its usage; count each message once.
+                        if let Some(u) = usage.filter(|_| id != slot.last_msg_id) {
+                            slot.live_units += u.input_units();
+                            slot.last_msg_id = id;
+                        }
+                    }
                     StreamEvent::RateLimit(info) => self.on_rate_limit(info),
                     StreamEvent::TurnEnd(res) => self.on_turn_end(idx, res),
                 }
@@ -359,6 +480,14 @@ impl Supervisor {
                     let slot = &mut self.slots[idx];
                     slot.idle_backoff = (slot.idle_backoff * 2).min(MAX_IDLE_BACKOFF);
                     self.enqueue(idx, Next::Nudge(Nudge::IdleCheck), false);
+                }
+            }
+        }
+        for s in &mut self.slots {
+            if s.phase == Phase::Recycling && s.recycle_deadline.is_some_and(|t| now >= t) {
+                s.recycle_deadline = None;
+                if let Some(h) = s.handle.as_mut() {
+                    h.kill();
                 }
             }
         }
@@ -454,6 +583,8 @@ impl Supervisor {
             agent: &slot.id,
             run_id: &ctx.run_id,
             cwd: &cwd,
+            hub_dir: &self.app.hub.dir,
+            colony_bin: ctx.colony_bin.as_deref(),
             session_id: &slot.session_id,
             resume,
             server_url: &ctx.server_url,
@@ -492,21 +623,28 @@ impl Supervisor {
             };
             let time_left = self.deadline.saturating_duration_since(Instant::now());
             let text = {
-                let board = self.app.board();
+                let mut board = self.app.board();
                 let slot = &self.slots[idx];
                 let text = match next {
-                    Next::Kickoff => prompts::kickoff(
-                        &slot.id,
-                        &board.goal().text,
-                        time_left,
-                        slot.setup_note.as_deref(),
-                    ),
-                    Next::Nudge(n) => prompts::nudge(&board, &slot.id, slot.seen_tasks, time_left, n),
+                    Next::Kickoff => prompts::kickoff(&slot.id, time_left, slot.setup_note.as_deref(), false),
+                    Next::Nudge(n) => {
+                        let inbox = board.take_inbox(&slot.id);
+                        let digest = prompts::nudge(&board, &slot.id, slot.seen_tasks, time_left, n, &inbox);
+                        if slot.fresh {
+                            format!(
+                                "{}\n\n{digest}",
+                                prompts::kickoff(&slot.id, time_left, None, true)
+                            )
+                        } else {
+                            digest
+                        }
+                    }
                 };
                 self.slots[idx].seen_tasks = board.tasks().len();
                 text
             };
             let slot = &mut self.slots[idx];
+            slot.fresh = false;
             let Some(handle) = slot.handle.as_mut() else {
                 continue;
             };
@@ -521,7 +659,11 @@ impl Supervisor {
     fn on_turn_end(&mut self, idx: usize, res: TurnResult) {
         let slot = &mut self.slots[idx];
         slot.turns += 1;
+        if let Some(u) = &res.usage {
+            self.meter.calibrate(res.total_cost_usd - slot.cost_cur, u);
+        }
         slot.cost_cur = res.total_cost_usd;
+        slot.live_units = 0.0;
         if res.limited {
             log(&format!(
                 "{}: turn ended on a usage limit: {}",
@@ -563,25 +705,54 @@ impl Supervisor {
         self.after_turn(idx);
     }
 
-    /// Decides between another turn and sleep. A worker holding a claim or mentioned in chat goes again.
+    /// Decides between another turn and sleep (`decide_next`), and whether the next turn starts in a fresh
+    /// session (`should_recycle`).
     fn after_turn(&mut self, idx: usize) {
-        let (has_claim, claimable, mentioned) = {
+        let (has_claim, claimable, direct) = {
             let b = self.app.board();
             let id = &self.slots[idx].id;
             (
                 b.claim_of(id).is_some(),
                 b.claimable().len(),
-                !b.unread(id).mentions.is_empty(),
+                b.pending_direct(id),
             )
         };
+        let all_done = self.all_done_for == Some(idx);
+        if all_done {
+            self.all_done_for = None;
+        }
         let slot = &mut self.slots[idx];
         slot.idle_turns = if has_claim { 0 } else { slot.idle_turns + 1 };
-        if has_claim || mentioned || (claimable > 0 && slot.idle_turns <= MAX_IDLE_TURNS) {
-            slot.idle_backoff = Duration::from_secs(self.ctx.cfg.idle_secs);
-            self.enqueue(idx, Next::Nudge(Nudge::Continue), false);
+        let decision = decide_next(has_claim, all_done, direct, claimable, slot.idle_turns);
+        if should_recycle(self.ctx.cfg.fresh_session, has_claim, slot.done_in_session) {
+            self.recycle(idx, decision);
         } else {
-            slot.phase = Phase::Idle;
-            slot.idle_until = Some(Instant::now() + slot.idle_backoff);
+            self.apply(idx, decision);
+        }
+    }
+
+    fn apply(&mut self, idx: usize, decision: Decision) {
+        match decision {
+            Decision::Go(n) => {
+                self.slots[idx].idle_backoff = Duration::from_secs(self.ctx.cfg.idle_secs);
+                self.enqueue(idx, Next::Nudge(n), false);
+            }
+            Decision::Sleep => {
+                let slot = &mut self.slots[idx];
+                slot.phase = Phase::Idle;
+                slot.idle_until = Some(Instant::now() + slot.idle_backoff);
+            }
+        }
+    }
+
+    /// Closes the worker's stdin; `on_exited` starts it again in a new session and applies `decision`.
+    fn recycle(&mut self, idx: usize, decision: Decision) {
+        let slot = &mut self.slots[idx];
+        slot.after_recycle = Some(decision);
+        slot.phase = Phase::Recycling;
+        slot.recycle_deadline = Some(Instant::now() + RECYCLE_TIMEOUT);
+        if let Some(h) = slot.handle.as_mut() {
+            h.close();
         }
     }
 
@@ -597,6 +768,7 @@ impl Supervisor {
     }
 
     fn on_rate_limit(&mut self, info: RateLimitInfo) {
+        self.track_utilization(&info);
         if info.is_rejected() {
             self.on_limited(info.resets_at);
         } else if info.is_warning() {
@@ -616,6 +788,51 @@ impl Supervisor {
             }
         }
         self.rate_limit = Some(info);
+    }
+
+    /// Projects the five-hour window to its reset and lowers concurrency by one when it would run out. The
+    /// limit events alone arrive only at the edge (observed: one 6-worker run used 0.29 → 0.76 of the window
+    /// in 26 minutes).
+    fn track_utilization(&mut self, info: &RateLimitInfo) {
+        let (Some(u), Some(reset)) = (info.five_hour, info.five_hour_resets_at) else {
+            return;
+        };
+        let now_s = chrono::Utc::now().timestamp();
+        if self.five_hour_resets_at != Some(reset) {
+            self.five_hour.clear();
+            self.five_hour_resets_at = Some(reset);
+        }
+        if self
+            .five_hour
+            .back()
+            .is_none_or(|&(t, _)| now_s - t >= MIN_SAMPLE_GAP_SECS)
+        {
+            self.five_hour.push_back((now_s, u));
+        }
+        while self
+            .five_hour
+            .front()
+            .is_some_and(|&(t, _)| now_s - t > UTILIZATION_WINDOW_SECS)
+        {
+            self.five_hour.pop_front();
+        }
+        self.projected = project_utilization(&self.five_hour, now_s, reset);
+        let now = Instant::now();
+        if self.projected.is_some_and(|p| p > 1.0)
+            && self.limit > 1
+            && self
+                .last_projection_cut
+                .is_none_or(|t| now.duration_since(t) >= PROJECTION_CUT_EVERY)
+        {
+            self.last_projection_cut = Some(now);
+            self.limit -= 1;
+            self.streak = 0;
+            log(&format!(
+                "five-hour usage projected at {:.0}% by its reset: concurrency limit down to {}",
+                self.projected.unwrap_or_default() * 100.0,
+                self.limit
+            ));
+        }
     }
 
     /// Usage limit hit. If already paused, treat it as the same incident and cut only once.
@@ -652,6 +869,21 @@ impl Supervisor {
                 self.stop(StopReason::Complete);
                 return;
             }
+            BoardSignal::TaskDone { agent, all_done } => {
+                let Some(idx) = self.slots.iter().position(|s| &s.id == agent) else {
+                    return;
+                };
+                self.slots[idx].done_in_session += 1;
+                if *all_done {
+                    self.all_done_for = Some(idx);
+                    // Normally the worker is mid-turn and gets the request when its turn ends.
+                    if self.slots[idx].phase == Phase::Idle {
+                        self.all_done_for = None;
+                        self.enqueue(idx, Next::Nudge(Nudge::AllDone), false);
+                    }
+                }
+                return;
+            }
             BoardSignal::NewWork => (0..self.slots.len()).collect(),
             BoardSignal::Mention(ids) => {
                 let all = ids.iter().any(|i| i == "all");
@@ -661,10 +893,18 @@ impl Supervisor {
             }
         };
         for idx in wake {
-            if self.slots[idx].phase == Phase::Idle {
-                self.slots[idx].idle_backoff = Duration::from_secs(self.ctx.cfg.idle_secs);
-                self.slots[idx].idle_turns = 0;
-                self.enqueue(idx, Next::Nudge(Nudge::Woken), false);
+            match self.slots[idx].phase {
+                Phase::Idle => {
+                    self.slots[idx].idle_backoff = Duration::from_secs(self.ctx.cfg.idle_secs);
+                    self.slots[idx].idle_turns = 0;
+                    self.enqueue(idx, Next::Nudge(Nudge::Woken), false);
+                }
+                // About to sleep in a fresh session: wake it there instead.
+                Phase::Recycling if self.slots[idx].after_recycle == Some(Decision::Sleep) => {
+                    self.slots[idx].idle_turns = 0;
+                    self.slots[idx].after_recycle = Some(Decision::Go(Nudge::Woken));
+                }
+                _ => {}
             }
         }
     }
@@ -677,10 +917,28 @@ impl Supervisor {
         slot.handle = None;
         slot.cost_done += slot.cost_cur;
         slot.cost_cur = 0.0;
+        slot.live_units = 0.0;
         match slot.phase {
             Phase::Failed => {}
             Phase::Closing | Phase::Exited => slot.phase = Phase::Exited,
             _ if self.stopping.is_some() => slot.phase = Phase::Exited,
+            Phase::Recycling => {
+                slot.session_id = uuid::Uuid::new_v4().to_string();
+                slot.done_in_session = 0;
+                slot.fresh = true;
+                slot.recycle_deadline = None;
+                let decision = slot.after_recycle.take().unwrap_or(Decision::Sleep);
+                match self.spawn_process(idx, false) {
+                    Ok(()) => self.apply(idx, decision),
+                    Err(e) => {
+                        log(&format!(
+                            "{}: fresh session failed to start: {e:#}",
+                            self.slots[idx].id
+                        ));
+                        self.fail(idx);
+                    }
+                }
+            }
             _ => {
                 if slot.restarts >= MAX_RESTARTS {
                     log(&format!(
@@ -695,7 +953,9 @@ impl Supervisor {
                     "{}: exited unexpectedly (code {code:?}); resuming its session",
                     slot.id
                 ));
-                match self.spawn_process(idx, true) {
+                // A fresh session that never got its first message has nothing to resume.
+                let resume = !slot.fresh;
+                match self.spawn_process(idx, resume) {
                     Ok(()) => self.enqueue(idx, Next::Nudge(Nudge::Restarted), false),
                     Err(e) => {
                         log(&format!("{}: restart failed: {e:#}", self.slots[idx].id));
@@ -711,6 +971,7 @@ impl Supervisor {
         let id = self.slots[idx].id.clone();
         let released = {
             let mut b = self.app.board();
+            b.drop_reservations(&id, now_ms());
             let held = b.claim_of(&id).map(|t| t.id.clone());
             held.filter(|t| {
                 b.release(&id, t, "worker failed; released by the harness", now_ms())
@@ -757,6 +1018,7 @@ impl Supervisor {
         self.stopping = Some(reason);
         let grace = match reason {
             StopReason::Complete => self.ctx.cfg.grace_secs.min(60),
+            StopReason::Budget => self.ctx.cfg.grace_secs.min(BUDGET_GRACE_SECS),
             _ => self.ctx.cfg.grace_secs,
         };
         self.kill_at = Some(Instant::now() + Duration::from_secs(grace));
@@ -768,6 +1030,11 @@ impl Supervisor {
             match self.slots[idx].phase {
                 Phase::Pending | Phase::Preparing => self.slots[idx].phase = Phase::Exited,
                 Phase::Exited | Phase::Failed => {}
+                // Past the cap, a running turn is interrupted rather than left to finish (flush_interrupts).
+                Phase::Working if reason == StopReason::Budget => {
+                    self.slots[idx].interrupt = true;
+                    self.slots[idx].phase = Phase::Closing;
+                }
                 _ => self.close(idx),
             }
         }
@@ -775,6 +1042,22 @@ impl Supervisor {
             "stopping ({}): waiting up to {grace}s for in-flight turns",
             reason.label()
         ));
+    }
+
+    /// Sends the interrupts a budget stop asked for, then closes those workers' stdin.
+    async fn flush_interrupts(&mut self) {
+        for slot in &mut self.slots {
+            if !slot.interrupt {
+                continue;
+            }
+            slot.interrupt = false;
+            if let Some(h) = slot.handle.as_mut() {
+                if let Err(e) = h.interrupt().await {
+                    log(&format!("{}: failed to interrupt: {e}", slot.id));
+                }
+                h.close();
+            }
+        }
     }
 
     fn finished(&self) -> bool {
@@ -787,8 +1070,13 @@ impl Supervisor {
         self.slots.iter().filter(|s| s.phase == Phase::Working).count()
     }
 
+    /// Settled cost from results plus the live estimate for calls since each worker's last result.
     fn total_cost(&self) -> f64 {
-        self.slots.iter().map(|s| s.cost_done + s.cost_cur).sum()
+        self.slots.iter().map(|s| self.slot_cost(s)).sum()
+    }
+
+    fn slot_cost(&self, s: &Slot) -> f64 {
+        s.cost_done + s.cost_cur + self.meter.estimate(s.live_units)
     }
 
     fn report(&self) {
@@ -843,6 +1131,8 @@ impl Supervisor {
             queued: self.slots.iter().filter(|s| s.phase == Phase::Queued).count(),
             paused_until_ms,
             rate_limit: self.rate_limit.clone(),
+            five_hour_projected: self.projected,
+            model: self.model.clone(),
             total_cost_usd: self.total_cost(),
             max_cost_usd: self.ctx.cfg.max_cost_usd,
             hub_head: self.hub_head.clone(),
@@ -855,7 +1145,7 @@ impl Supervisor {
                     phase: Some(s.phase),
                     claim,
                     turns: s.turns,
-                    cost_usd: s.cost_done + s.cost_cur,
+                    cost_usd: self.slot_cost(s),
                     activity: s.activity.clone(),
                     restarts: s.restarts,
                 })
@@ -884,6 +1174,60 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decide_keeps_claim_holders_and_the_closer_going() {
+        assert_eq!(decide_next(true, false, 0, 0, 0), Decision::Go(Nudge::Continue));
+        assert_eq!(
+            decide_next(false, true, 0, 0, 5),
+            Decision::Go(Nudge::AllDone),
+            "the worker that finished the last task is asked to close the goal"
+        );
+    }
+
+    #[test]
+    fn decide_sleeps_without_claimable_work_or_direct_mentions() {
+        assert_eq!(decide_next(false, false, 0, 0, 1), Decision::Sleep);
+        assert_eq!(decide_next(false, false, 1, 0, 1), Decision::Go(Nudge::Continue));
+        assert_eq!(decide_next(false, false, 0, 2, 1), Decision::Go(Nudge::Continue));
+        assert_eq!(
+            decide_next(false, false, 0, 2, MAX_IDLE_TURNS + 1),
+            Decision::Sleep,
+            "turns that keep ending without a claim stop the loop"
+        );
+    }
+
+    #[test]
+    fn decide_recycles_only_after_a_completed_task_without_a_claim() {
+        assert!(should_recycle(true, false, 1));
+        assert!(!should_recycle(true, true, 1), "never mid-task");
+        assert!(
+            !should_recycle(true, false, 0),
+            "nothing finished in this session"
+        );
+        assert!(!should_recycle(false, false, 3), "disabled by config");
+    }
+
+    #[test]
+    fn projection_extrapolates_the_observed_slope_to_the_reset() {
+        let samples: VecDeque<(i64, f64)> = [(0, 0.30), (600, 0.40)].into();
+        let p = project_utilization(&samples, 600, 600 + 3600).unwrap();
+        assert!((p - 1.0).abs() < 1e-9, "{p}");
+    }
+
+    #[test]
+    fn projection_needs_history_and_a_future_reset() {
+        let short: VecDeque<(i64, f64)> = [(0, 0.3), (60, 0.5)].into();
+        assert_eq!(project_utilization(&short, 60, 4000), None);
+        let flat: VecDeque<(i64, f64)> = [(0, 0.5), (600, 0.4)].into();
+        assert_eq!(
+            project_utilization(&flat, 600, 4000),
+            Some(0.4),
+            "a falling window is not extrapolated down"
+        );
+        let samples: VecDeque<(i64, f64)> = [(0, 0.3), (600, 0.4)].into();
+        assert_eq!(project_utilization(&samples, 600, 500), None);
+    }
 
     #[test]
     fn worker_ids_are_zero_padded_by_team_size() {

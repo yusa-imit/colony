@@ -95,24 +95,38 @@ verify = "pnpm install --frozen-lockfile && pnpm -w typecheck && pnpm -w test"
 gate_slots = 3                  # heavy commands allowed to run at once
 max_cost_usd = 40.0
 worker_budget_usd = 8.0         # per-worker cap (claude --max-budget-usd)
-idle_secs = 120
+idle_secs = 600                 # first check on an idle worker; doubles up to 15 minutes
 grace_secs = 300
+# fresh_session = true          # restart a worker in a new session after each task it completes
+# deliver_mid_turn = true       # hand direct mentions and new notes to workers after each tool call
+# keep_workspaces = false       # keep ws/ after a completed run
+# tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]   # claude --tools
 # permission_mode = "bypassPermissions"   # sandboxed machines only
-# allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "mcp__colony", "Bash(git *)", "Bash(pnpm *)"]
+# allowed_tools = ["Read", "Glob", "Grep", "mcp__colony", "Bash(git *)", "Bash(pnpm *)"]
 # disallowed_tools = ["Agent", "AskUserQuestion"]
 # setting_sources = "project,local"
+# sandbox = true                                    # run Bash in Claude Code's sandbox (see Isolation)
+# sandbox_allowed_domains = ["registry.npmjs.org"]
+# sandbox_allow_write = ["~/Library/pnpm"]
 ```
 
 ## Worker tools
 
 `board_view` `task_get` `task_propose` `task_claim` `task_progress` `task_release` `task_complete` `task_reopen`
-`chat_post` `chat_read` `note_add` `note_search` `goal_complete`
+`chat_post` `chat_read` `note_add` `note_search` `verify` `goal_complete`
 
 The harness enforces a few rules:
 
 - The board starts with one planning task, T1. The first worker to claim it decomposes the goal; the others
   sleep until tasks appear.
-- Claims are atomic, and a worker holds one task at a time.
+- Claims are atomic, and a worker holds one task at a time. Claiming a task whose dependencies are not done
+  reserves it instead: it becomes the reserver's claim when they are done.
+- One task per turn. After `task_complete` the worker ends its turn, and its next task starts in a fresh
+  session; the board, notes, task logs and git carry what it learned.
+- `@wNN` reaches a worker even mid-task (after its next tool call) and wakes it if idle. New notes reach every
+  worker the same way. `@all` is an announcement read at the next turn.
+- `verify` runs the configured verify command on colony-main and caches the result per commit, so nobody
+  re-runs the same check.
 - If `task_complete` is given a commit, that commit must already be on colony-main. Pushing is merging.
 - The hub rejects non-fast-forward and force pushes. Whoever arrives second rebases.
 - `goal_complete` is accepted only when no task is open or claimed and `verify` passes.
@@ -131,31 +145,45 @@ adjusts the pace:
 - On hitting a limit, everything pauses (until the reset time when known, otherwise from one minute, doubling)
   and concurrency is halved. The blocked turn goes back to the front of the queue.
 - In the warning state (`allowed_warning`), concurrency drops by one.
+- When the five-hour window is projected to run out before it resets (recent slope, extrapolated), concurrency
+  drops by one, at most every two minutes. The dashboard shows the projection.
 - As successful turns accumulate, concurrency climbs back by one at a time, up to `max_active`.
 
+Cost is estimated live from every API call, calibrated against each completed turn, so `--max-cost-usd` holds
+mid-turn. At the cap, running turns are interrupted rather than left to finish.
+
 Thirty-two workers take roughly 5–10 GB of process memory. The real bottlenecks are usage limits and build load.
-Start `max_active` around 8 and raise it while watching utilization on the dashboard.
+One 6-worker run used about half of a subscription's five-hour window in 26 minutes; on a single subscription
+start `max_active` at 4–6 and raise it while watching the projection on the dashboard.
 
 ## Isolation and safety
 
 - Workers start with `--setting-sources project,local --strict-mcp-config`. Your global plugins, hooks and MCP
-  servers are not loaded; the target repository's `.claude/` settings and `CLAUDE.md` are.
-- The default permissions are `acceptEdits` plus an allow list (`git`, package managers, read-only tools and
-  so on). Commands outside the list are denied without prompting (`--permission-prompts none`). Sub-agents
-  (`Agent`) and tools that ask a human are disallowed.
+  servers are not loaded; the target repository's `.claude/` settings and `CLAUDE.md` are. Variables that the
+  launching Claude Code session sets for itself (plugin dirs, its messaging socket, effort) are removed from
+  the workers' environment.
+- Workers get only the built-in tools in `tools` (default Bash, Read, Edit, Write, Glob, Grep).
+- The default permissions are `acceptEdits` plus an allow list (`git`, `cd`, `sed`, package managers,
+  read-only tools and so on). Write and Edit are allowed inside the worker's own clone only; scratch files go
+  in `.colony-tmp/` there, which git ignores. Commands outside the list are denied without prompting
+  (`--permission-prompts none`). Sub-agents (`Agent`) and tools that ask a human are disallowed.
+- `sandbox = true` runs Bash in Claude Code's sandbox instead: commands need no allow list, writes are
+  confined to the clone, the hub, temp dirs and `sandbox_allow_write`, and the network to localhost and
+  `sandbox_allowed_domains`. It is off by default because package stores and registries differ per machine.
 - Result commits never carry AI trailers (`Co-Authored-By: Claude …`, `🤖 Generated with …`). Worker settings
   keep them from being written, a `commit-msg` hook in each clone strips them, and a `pre-receive` hook in the
   hub rejects commits that skipped the hook. Existing history in the target repository is not inspected.
-- Workers operate only inside their own clones under `~/.colony/runs/<repo>-<run id>/ws/`. The target
-  repository is read at start and receives one branch at the end; nothing else touches it.
+- Workers operate inside their own clones under `~/.colony/runs/<repo>-<run id>/ws/`. The target repository is
+  read at start and receives one branch at the end; nothing else touches it. Without `sandbox`, Bash commands
+  on the allow list (`cp`, `mv`, `sed` …) can still reach other paths.
 
 ## Run directory
 
 ```
 ~/.colony/runs/<repo>-<run id>/
 ├── hub.git/              shared hub (bare)
-├── ws/w01 … wNN/         worker clones
-├── ws/_verify/           clone used to verify goal_complete
+├── ws/w01 … wNN/         worker clones (removed after a completed run unless keep_workspaces)
+├── ws/_verify/           clone used by verify and goal_complete
 ├── agents/wNN.jsonl      raw claude stream-json (including messages sent)
 ├── agents/wNN.stderr.log
 ├── agents/wNN.setup.log
@@ -163,6 +191,8 @@ Start `max_active` around 8 and raise it while watching utilization on the dashb
 ├── board.json            final board
 └── summary.json          stop reason, cost, duration, branch
 ```
+
+`colony clean` removes `ws/` from every finished run under `~/.colony/runs`.
 
 ## Development
 

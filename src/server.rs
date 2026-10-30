@@ -32,6 +32,18 @@ pub struct Verify {
     pub workspace: PathBuf,
 }
 
+/// One run of the verify command, kept per colony-main commit so nobody pays for the same check twice
+/// (observed in a real run: four or more workers re-ran the full chain on the same commit).
+#[derive(Debug, Clone)]
+pub struct VerifyRun {
+    pub head: String,
+    pub ok: bool,
+    pub code: Option<i32>,
+    pub tail: String,
+    pub by: String,
+    pub at_ms: i64,
+}
+
 pub struct Shared {
     board: Mutex<Board>,
     pub hub: Hub,
@@ -39,6 +51,7 @@ pub struct Shared {
     pub status: Mutex<RunStatus>,
     pub verify: Option<Verify>,
     pub verify_lock: tokio::sync::Mutex<()>,
+    pub verify_cache: Mutex<Option<VerifyRun>>,
     sup_tx: mpsc::UnboundedSender<SupEvent>,
     tool_log: Mutex<Option<std::fs::File>>,
 }
@@ -59,6 +72,7 @@ impl Shared {
             status: Mutex::new(RunStatus::default()),
             verify,
             verify_lock: tokio::sync::Mutex::new(()),
+            verify_cache: Mutex::new(None),
             sup_tx,
             tool_log: Mutex::new(tool_log),
         }
@@ -99,6 +113,7 @@ pub fn router(app: Arc<Shared>) -> Router {
         .route("/api/state", get(state))
         .route("/mcp", get(no_stream).post(mcp_post).delete(no_stream))
         .route("/gate/hold", get(gate_hold))
+        .route("/inbox", get(inbox))
         .with_state(app)
 }
 
@@ -141,6 +156,16 @@ async fn gate_hold(State(app): State<Arc<Shared>>, Query(q): Query<HashMap<Strin
         body,
     )
         .into_response()
+}
+
+/// What a worker has not been shown yet, as plain text (empty when nothing is pending). Read by the worker's
+/// PostToolUse hook through `colony inbox`; each item is delivered once.
+async fn inbox(State(app): State<Arc<Shared>>, Query(q): Query<HashMap<String, String>>) -> String {
+    let Some(agent) = q.get("agent") else {
+        return String::new();
+    };
+    let inbox = app.board().take_inbox(agent);
+    crate::prompts::render_inbox(&inbox).unwrap_or_default()
 }
 
 async fn state(State(app): State<Arc<Shared>>) -> Json<Value> {

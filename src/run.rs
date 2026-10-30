@@ -96,6 +96,12 @@ pub async fn run(cfg: Config) -> Result<Finished> {
             .map(|c| format!("${c}"))
             .unwrap_or_else(|| "none".into())
     );
+    eprintln!(
+        "  model       {}",
+        cfg.model
+            .as_deref()
+            .unwrap_or("claude default (see the log once workers start)")
+    );
     eprintln!("  run dir     {}", run_dir.display());
     eprintln!("  Ctrl+C once: stop after in-flight turns finish · twice: stop immediately");
     eprintln!();
@@ -103,6 +109,7 @@ pub async fn run(cfg: Config) -> Result<Finished> {
     let system_prompt = prompts::system_prompt(&ProtocolVars {
         workers: cfg.workers,
         verify: cfg.verify.as_deref(),
+        goal: &cfg.goal,
     });
     let ctx = Arc::new(RunCtx {
         repo_label: repo_name.clone(),
@@ -111,8 +118,10 @@ pub async fn run(cfg: Config) -> Result<Finished> {
         server_url,
         email,
         system_prompt,
+        colony_bin: std::env::current_exe().ok(),
         cfg,
     });
+    let keep_workspaces = ctx.cfg.keep_workspaces;
     let outcome = Supervisor::new(ctx, app.clone(), tx, rx).run().await;
 
     let head = app.hub.head().await?;
@@ -134,6 +143,12 @@ pub async fn run(cfg: Config) -> Result<Finished> {
     });
     tokio::fs::write(run_dir.join("summary.json"), serde_json::to_vec_pretty(&summary)?).await?;
     server.abort();
+    // The result is on the branch and the logs stay; the clones are only bulk (a real run left 2.2 GB).
+    if outcome.reason == StopReason::Complete && branch.is_some() && !keep_workspaces {
+        if let Err(e) = tokio::fs::remove_dir_all(run_dir.join("ws")).await {
+            log(&format!("could not remove the workspaces: {e}"));
+        }
+    }
     Ok(Finished {
         outcome,
         branch,
@@ -161,6 +176,25 @@ pub fn print_summary(f: &Finished) {
     }
 }
 
+/// `colony clean`: removes `ws/` from every finished run (one with `summary.json`) under `state_dir`.
+/// Returns the run directories cleaned.
+pub fn clean(state_dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut cleaned = Vec::new();
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return Ok(cleaned);
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let ws = dir.join("ws");
+        if dir.join("summary.json").is_file() && ws.is_dir() {
+            std::fs::remove_dir_all(&ws).with_context(|| format!("failed to remove {}", ws.display()))?;
+            cleaned.push(dir);
+        }
+    }
+    cleaned.sort();
+    Ok(cleaned)
+}
+
 async fn check_claude(bin: &str) -> Result<()> {
     match tokio::process::Command::new(bin).arg("--version").output().await {
         Ok(out) if out.status.success() => Ok(()),
@@ -169,5 +203,29 @@ async fn check_claude(bin: &str) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         ),
         Err(e) => bail!("claude CLI not found (`{bin}`): {e}. Install Claude Code or set COLONY_CLAUDE_BIN"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_removes_only_finished_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let finished = tmp.path().join("repo-1");
+        let running = tmp.path().join("repo-2");
+        for d in [&finished, &running] {
+            std::fs::create_dir_all(d.join("ws/w1")).unwrap();
+            std::fs::create_dir_all(d.join("agents")).unwrap();
+        }
+        std::fs::write(finished.join("summary.json"), "{}").unwrap();
+        assert_eq!(clean(tmp.path()).unwrap(), vec![finished.clone()]);
+        assert!(!finished.join("ws").exists() && finished.join("agents").exists());
+        assert!(
+            running.join("ws").exists(),
+            "a run without summary.json may still be going"
+        );
+        assert!(clean(&tmp.path().join("missing")).unwrap().is_empty());
     }
 }
