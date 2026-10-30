@@ -60,7 +60,9 @@ collaboration rule pinned down by unit tests.
 ### D1. Language: Rust, single binary
 
 The deliverable must be one file. The toolchain is pinned (1.98.1) and releases use a size-optimized profile
-(strip, LTO). The dashboard HTML is compiled in with `include_str!`.
+(strip, LTO). The dashboard HTML is compiled in with `include_str!`. A version tag builds and publishes the
+release (`.github/workflows/release.yml`): macOS for Apple Silicon and Intel, and Linux for x86-64 and arm64 as
+static musl binaries. The dependency tree is pure Rust on these targets, so no C toolchain is involved.
 
 ### D2. Worker ↔ harness protocol: MCP (JSON-RPC over HTTP), not gRPC
 

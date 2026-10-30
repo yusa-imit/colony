@@ -1,0 +1,135 @@
+# Builds colony for macOS and Linux and publishes a GitHub release when a version tag (v0.1.1) is pushed.
+#
+# The tag must match `version` in Cargo.toml, and CHANGELOG.md must have a section for it; its text becomes
+# the release notes. The release is created as a draft, every build uploads its archive and checksum, and the
+# release is published only when all of them are there. A pull request that touches the release setup runs
+# the same builds without publishing anything.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/scripts/**"
+      - "CHANGELOG.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read the version and check it against the tag
+        id: version
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+      - name: Write the release notes
+        run: .github/scripts/release-notes.sh "${{ steps.version.outputs.version }}" | tee notes.md
+      - name: Create the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "colony $VERSION" --notes-file notes.md
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [ci, prepare]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, arch: arm64 }
+          - { target: x86_64-apple-darwin, os: macos-latest, arch: x86_64 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, arch: x86-64 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install rustup if the image lacks it
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Check the binary
+        run: |
+          bin="target/$TARGET/release/colony"
+          file "$bin"
+          file "$bin" | grep -q "${{ matrix.arch }}"
+          case "$TARGET" in
+            *-musl) file "$bin" | grep -Eq "statically linked|static-pie linked" ;;
+          esac
+          # Runs natively everywhere except the Intel build on an Apple Silicon runner.
+          if [ "$TARGET" != x86_64-apple-darwin ]; then "$bin" --version; fi
+      - name: Package
+        run: .github/scripts/package.sh "$VERSION" "$TARGET"
+      - name: Upload to the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+  publish:
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check that every archive and checksum is attached
+        run: |
+          count=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')
+          echo "$count assets"
+          [ "$count" -eq 8 ]
+      - name: Publish
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

@@ -36,6 +36,18 @@ notes.
 
 ## Install
 
+Download the archive for your platform from [Releases](https://github.com/yusa-imit/colony/releases): macOS
+(Apple Silicon, Intel) or Linux (x86-64, arm64; static binaries). Each archive has a SHA-256 file next to it.
+
+```sh
+shasum -a 256 -c colony-<version>-<target>.tar.gz.sha256
+tar -xzf colony-<version>-<target>.tar.gz
+xattr -d com.apple.quarantine colony 2>/dev/null   # macOS: the binary is not notarized
+mv colony ~/.local/bin/
+```
+
+Or build it yourself:
+
 ```sh
 cargo build --release          # target/release/colony — put this one file on your PATH
 cp target/release/colony ~/.local/bin/
@@ -205,7 +217,19 @@ cargo clippy --all-targets
 MCP endpoint. It exercises the whole harness (contended pushes, limit handling, wake-ups, export) in seconds,
 without an LLM.
 
-Architecture and decisions: [`docs/design.md`](docs/design.md).
+Architecture and decisions: [`docs/design.md`](docs/design.md). Changes per version:
+[`CHANGELOG.md`](CHANGELOG.md).
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test` on Linux and macOS for every push to `main` and every pull request.
+
+### Releasing
+
+1. Bump `version` in `Cargo.toml` (and `Cargo.lock`), and add a `## [x.y.z] - <date>` section to
+   `CHANGELOG.md`. That section becomes the release notes.
+2. Merge to `main`, then push the tag: `git tag vx.y.z && git push origin vx.y.z`.
+3. `.github/workflows/release.yml` checks the tag against `Cargo.toml`, runs CI, and builds the four
+   archives. It publishes the release once all of them are attached.
 
 ## Citation
 

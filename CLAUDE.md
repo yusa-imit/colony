@@ -25,6 +25,9 @@ cargo clippy --all-targets
 cargo test        # unit + hub (git) + e2e (three fake claude workers, examples/fake_claude.rs)
 ```
 
+CI runs the same commands on Linux and macOS (`.github/workflows/ci.yml`, clippy with `-D warnings`). Releases
+are cut by pushing a version tag; see README "Releasing".
+
 The e2e test runs the whole harness without an LLM; it must pass after any change to the supervisor, MCP or
 hub. After changing worker-facing behavior (prompts, tools), run real claude once against a toy repository and
 add the result to the field notes.
